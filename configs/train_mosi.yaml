@@ -1,8 +1,8 @@
 base:
   seed: 1111
-  lr: 0.00001
-  weight_decay: 0.00001
-  batch_size: 16
+  lr: 0.0001
+  weight_decay: 0.0001
+  batch_size: 32
   n_epochs: 100
   num_workers: 0
   gamma: 0.1
@@ -11,16 +11,23 @@ base:
   train_mode: regression # only support regression now
   missing_rate_eval_test: 0.5   # used for evaluation and testing
   do_validation: true
+  use_hardness: True  # 打开难度感知，默认是 False
 
 
 dataset:
   datasetName: mosi
-  dataPath: /media/a303/8d872b70-f5b1-4378-98d2-09c7310cc676/storage/nfs/mengjing/Project/P-RMF-main/data/MSA_Datasets/MOSI/Processed/unaligned_50.pkl
+  dataPath: /root/autodl-fs/data/MSA_Datasets/MOSI/unaligned_50.pkl
    
+hardness:
+  alpha_pred: 0.7     # 预测误差占比
+  alpha_rec: 0.3       # 重构误差占比
+  eps: 1e-6
+  use_loss_reweight: True  # 打开 hard 样本轻微重加权
+
 
 model:    
   feature_extractor:
-    bert_pretrained: bert/bert-base-uncased #    bert_pretrained: '../bert/bert-large-uncased'
+    bert_pretrained: '/root/autodl-fs/bert/bert-base-uncased' #    bert_pretrained: '../bert/bert-large-uncased'
     transformers: 'bert'  # transformers: bert
     input_length: [50, 500, 375] # language, video, audio
     token_length: [8, 8, 8] # language, video, audio
@@ -56,7 +63,7 @@ model:
     out_dim: 128
 
   regression:
-    attn_dropout: 0.5
+    attn_dropout: 0.5 #0.5
     input_dim: 128
     hidden_dim: 128
     out_dim: 1
