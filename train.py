@@ -2,6 +2,7 @@ import os
 import torch
 import yaml
 import argparse
+import numpy as np
 from core.dataset import MMDataLoader
 from core.losses import MultimodalLoss
 from core.scheduler import get_scheduler
@@ -28,48 +29,64 @@ print("-------------------------------------------------------------------------
 print(opt)    #Namespace(config_file='configs/train_mosi.yaml', seed=1111)
 print("-------------------------------------------------------------------------------")
 
-def map_hardness_to_weights(h, mode='linear_center', alpha=0.5, device='cuda'):
-    """
-    h: [B] ∈ [0,1]
-    mode: 'linear_center' / 'power' / 'piecewise'
-    """
-    h = h.to(device)
+class DynamicWeightScheduler:
+    def __init__(self, total_epochs, warmup_epochs=5):
+        self.total_epochs = total_epochs
+        self.warmup_epochs = warmup_epochs
 
-    if mode == 'linear_center':
-        # 方案 A
-        h_centered = h - h.mean()
-        w = 1.0 + alpha * h_centered
-        max_delta = 0.5
-        w = torch.clamp(w, 1.0 - max_delta, 1.0 + max_delta)
+    def get_weights(self, hardness, epoch, device='cuda'):
+        """
+        根据训练进度动态调整关注点：
+        - 初期：关注中低难度 (打基础)
+        - 中后期：关注高难度 (提上限)
+        - 全程：抑制极值离群点 (防崩塌)
+        """
+        h = hardness.to(device)
+        weights = torch.ones_like(h)
+        
+        # --- 1. 预热期 (Warmup) ---
+        # 前几轮不加权，让 VAE 和 GRL 充分预热
+        if epoch < self.warmup_epochs:
+            return weights
 
-    elif mode == 'power':
-        # 方案 B
-        beta = alpha  # 这里用 alpha 当 beta
-        eps = 1e-6
-        w = torch.pow(h + eps, beta)
-        if torch.all(w <= 0):
-            w = torch.ones_like(w)
+        # --- 2. 计算进度因子 (Progress) ---
+        # 将剩余的轮数映射到 [0, 1]
+        # 我们设定在 80% 的时候达到最难的关注点，最后 20% 保持稳定
+        effective_epochs = self.total_epochs - self.warmup_epochs
+        current_step = epoch - self.warmup_epochs
+        progress = np.clip(current_step / (effective_epochs * 0.4 + 1e-6), 0.0, 1.0)
 
-    elif mode == 'piecewise':
-        # 方案 C
-        t_low = 0.3
-        t_high = 0.8
-        w = torch.ones_like(h)
-        mask_easy = h < t_low
-        mask_mid = (h >= t_low) & (h <= t_high)
-        mask_too_hard = h > t_high
+        # --- 3. 动态移动关注中心 (Moving Focus) ---
+        # 核心逻辑：关注中心 mu 从 0.3 (易) 逐渐滑向 0.8 (难)
+        # 这样 Epoch 10-25 学简单的，Epoch 40+ 强迫模型去学难的
+        mu = 0.3 + 0.5 * progress  
+        
+        # 聚焦范围 sigma：随着训练进行，聚焦越来越集中 (0.2 -> 0.15)
+        sigma = 0.2 - 0.05 * progress
+        
+        # 加权强度 strength：后期强度更大 (1.0 -> 3.0)
+        strength = 1.0 + 2.0 * progress
 
-        w[mask_easy] = 0.8
-        w[mask_mid] = 1.0 + alpha * (h[mask_mid] - t_low) / (t_high - t_low + 1e-8)
-        w[mask_too_hard] = 1.0
+        # --- 4. 高斯加权公式 ---
+        # w = 1 + strength * exp(...)
+        gaussian_weight = torch.exp(-0.5 * ((h - mu) ** 2) / (sigma ** 2))
+        weights = 1.0 + strength * gaussian_weight
 
-    else:
-        w = torch.ones_like(h)
+        # --- 5. 离群点熔断 (Outlier Cutoff) ---
+        # 始终抑制难度极高 (>0.95) 的样本，防止脏数据破坏模型
+        # 注意：这里的阈值要比 mu 的终点(0.8)高，给难样本留出空间
+        outlier_thresh = 0.95
+        mask_outlier = h > outlier_thresh
+        if mask_outlier.any():
+            # 对离群点降权到 0.1 (保留一点点梯度，或者直接设为0)
+            weights[mask_outlier] = 0.1
 
-    # 归一化到 mean=1
-    w = w / (w.mean() + 1e-8)
-    return w
-
+        # --- 6. 均值归一化 ---
+        # 保持 batch 总 loss 规模稳定
+        if weights.sum() > 1e-6:
+            weights = weights / weights.mean()
+        
+        return weights
 
 def main():
     best_valid_results, best_test_results = {}, {}
@@ -119,7 +136,13 @@ def main():
     # ====== 难度感知模块初始化 ======
     use_hardness = args['base'].get('use_hardness', False)
     hard_cfg = args.get('hardness', {})
-    #curr_cfg = args.get('curriculum', {})
+
+
+    # [新增] 初始化动态权重调度器
+    weight_scheduler = DynamicWeightScheduler(
+        total_epochs=args['base']['n_epochs'], 
+        warmup_epochs=5  # 前5轮预热
+    )
 
     if use_hardness:
         # 1) 难度估计器 初始化
@@ -132,18 +155,6 @@ def main():
 
         # 2) 是否启用 loss 重加权 / 采样
         use_loss_reweight = hard_cfg.get('use_loss_reweight', True)
-        use_sampling = hard_cfg.get('use_sampling', False)
-
-        # # 3) 采样调度器（“软 curriculum”）
-        # hardness_scheduler = HardnessScheduler(
-        #     strategy=curr_cfg.get('strategy', 'none'),        # 'none' / 'hard' / 'easy'
-        #     focus=curr_cfg.get('focus', 'hard'),
-        #     start_epoch=curr_cfg.get('start_epoch', 2),
-        #     warmup_epochs=curr_cfg.get('warmup_epochs', 5),
-        #     max_strength=curr_cfg.get('max_strength', 0.5),
-        #     beta=curr_cfg.get('beta', 2.0),
-        #     eps=curr_cfg.get('eps', 1e-6),
-        # )
 
         # 4) 全局 hardness 缓存：每个训练样本一个值
         train_dataset = dataLoader['train'].dataset
@@ -162,40 +173,15 @@ def main():
 
     for epoch in range(1, args['base']['n_epochs'] + 1):
         print(f'Training Epoch: {epoch}')
-        start_time = time.time()
-
-        # ====== 根据 hardness 构造本 epoch 的 train_loader（可选）======
-        # if use_hardness and use_sampling and (hardness_scheduler is not None):
-        #     # 使用上一轮的 global_hardness 生成采样权重
-        #     sample_weights = hardness_scheduler.get_sample_weights(
-        #         global_hardness=global_hardness.to(device),
-        #         epoch=epoch,
-        #     )  # [N]
-
-        #     # 注意：这里用 replacement=False，保证每个样本每个 epoch 只被抽一次，
-        #     # 这样不会破坏你在 MMDataset.__getitem__ 中基于 index==0 的缺失刷新逻辑。
-        #     sampler = WeightedRandomSampler(
-        #         weights=sample_weights,
-        #         num_samples=len(sample_weights),
-        #         replacement=False,
-        #     )
-
-        #     epoch_train_loader = DataLoader(
-        #         train_dataset,
-        #         batch_size=args['base']['batch_size'],
-        #         sampler=sampler,
-        #         num_workers=args['base']['num_workers'],
-        #     )
-        # else:
-            # 不使用 hardness 采样时，保持原始行为
-        
+        start_time = time.time()   
         train_loader = tqdm(dataLoader['train'], total=len(dataLoader['train']))
 
         train(model, train_loader, optimizer, loss_fn, epoch, metrics,
               hardness_estimator=hardness_estimator,
               global_hardness=global_hardness,
               use_hardness=use_hardness,
-              use_loss_reweight=use_loss_reweight)
+              use_loss_reweight=use_loss_reweight,
+              weight_scheduler=weight_scheduler)
 
         # 每个 epoch 结束后，打印 hardness 分布方便你观察
         if use_hardness and (global_hardness is not None):
@@ -223,7 +209,7 @@ def main():
 
 def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
          hardness_estimator=None, global_hardness=None,
-         use_hardness=False, use_loss_reweight=False):
+         use_hardness=False, use_loss_reweight=False, weight_scheduler=None):
     """
     训练一个 epoch。
     如果 use_hardness=True：
@@ -277,18 +263,33 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
                 old_values = global_hardness[idx_cpu]        # [B]
                 new_values = batch_hardness.detach().cpu()   # [B]
 
-                momentum = 0.8
+                momentum = 0.9
                 global_hardness[idx_cpu] = momentum * old_values + (1.0 - momentum) * new_values
 
             # 1.2 把 hardness 映射为 loss 权重（可选）
-            if use_loss_reweight:
+            if use_loss_reweight and weight_scheduler is not None:
+               # [改进] 尝试从 global_hardness 获取当前 batch 的平滑难度
+               if global_hardness is not None:
+                 indices = data['index']
+                 if isinstance(indices, torch.Tensor):
+                    idx_cpu = indices.long().cpu()
+                 else:
+                    idx_cpu = torch.tensor(indices, dtype=torch.long)
+                
+                 # 使用历史平滑难度 (更稳定)
+                 current_h = global_hardness[idx_cpu].to(device)
+            else:
+                # 降级方案
+               current_h = batch_hardness
 
-                # （0）最初始的方案： 简单线性映射：h∈[0,1] → w∈[0.5,1.5] (可选别的方式)
-                #w = 0.5 + batch_hardness.to(device)    # [B]
-                # 再归一化到均值为 1，避免改变 overall scale
-                #w = w / (w.mean() + 1e-8)
-                #sample_weights = w
-                sample_weights = map_hardness_to_weights(batch_hardness, mode='piecewise', alpha= 1.0, device=device)
+            sample_weights = weight_scheduler.get_weights(current_h, epoch, device)
+            #（0）最初始的方案： 简单线性映射：h∈[0,1] → w∈[0.5,1.5] ##3
+            #w = 0.5 + batch_h_smooth.to(device)    # [B]
+            #再归一化到均值为 1，避免改变 overall scale
+            #w = w / (w.mean() + 1e-8)
+            #sample_weights = w
+            ####
+            #sample_weights = map_hardness_to_weights(current_h, mode='piecewise', alpha= 1.0, device=device)
 
         # ====== Step 2: 计算 loss（支持样本级加权） ======
         loss = loss_fn(out, label, sample_weights=sample_weights)
