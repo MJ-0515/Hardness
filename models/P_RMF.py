@@ -98,8 +98,11 @@ class P_RMF(nn.Module):
             complete_audio_feat = self.proj_a(audio)[:, :8]
 
         #*Step 3: PMG 输出：kl损失, 代理模态 proxy_m [B,8,128], 模态不确定性权重 weight_t_v_a 
+        # kl_loss, proxy_m, weight_t_v_a = self.generate_proxy_modality(h_1_l, h_1_v, h_1_a, complete_language_feat,
+        #                                                               complete_vision_feat, complete_audio_feat)
         kl_loss, proxy_m, weight_t_v_a = self.generate_proxy_modality(h_1_l, h_1_v, h_1_a, complete_language_feat,
-                                                                      complete_vision_feat, complete_audio_feat)
+                                                                       complete_vision_feat, complete_audio_feat)
+
         #把主导模态过一次 Gradient Reversal Layer (GRL)，目的是在后续对抗/域不变学习里让代理模态更“稳健”（数值方向反转，使上游学到更判别/稳健的表征）
         proxy_m = self.GRL(proxy_m) 
         # proxy_m、三模态不完整输入、模态权重weight_t_v_a 一起送入 CrossmodalEncoder（即 PDDI 动态跨模态注入模块）
@@ -107,7 +110,11 @@ class P_RMF(nn.Module):
         #逐层用 proxy_m 作为 Query，对（t,a,v）做 CMA，并按 weight_t_v_a[0/2/1] 加权：
         #cma_t(proxy,t)*w_t + cma_a(proxy,a)*w_a + cma_v(proxy,v)*w_v + proxy
         #先对 token 做均值池化，再过 MLP(128→128→out_dim)得到情感预测值
-        output = self.predict(torch.mean(feat, dim=1)) #(B,1)
+
+        """ ✅ 新增：融合特征（后面做检索 & hardness 用）"""
+        fusion_feat = torch.mean(feat, dim=1)  # [B, D]
+
+        output = self.predict(fusion_feat) #(B,1)
         #(可选)重建分支输出监督信号
         rec_feats, complete_feats, effectiveness_discriminator_out, proxy_X, kl_p = None, None, None, None, 0.0
         if (vision is not None) and (audio is not None) and (language is not None):
@@ -123,8 +130,10 @@ class P_RMF(nn.Module):
         return {'sentiment_preds': output,
                 'rec_feats': rec_feats,
                 'complete_feats': complete_feats,
-                'kl_loss': kl_loss
+                'kl_loss': kl_loss,
+                'fusion_feat': fusion_feat    # ✅ 新增字段
                 }
+ 
 
 
 def build_model(args):
