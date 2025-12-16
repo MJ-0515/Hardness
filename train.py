@@ -35,59 +35,48 @@ class DynamicWeightScheduler:
         self.warmup_epochs = warmup_epochs
 
     def get_weights(self, hardness, epoch, device='cuda'):
-        """
-        根据训练进度动态调整关注点：
-        - 初期：关注中低难度 (打基础)
-        - 中后期：关注高难度 (提上限)
-        - 全程：抑制极值离群点 (防崩塌)
-        """
         h = hardness.to(device)
-        weights = torch.ones_like(h)
-        
-        # --- 1. 预热期 (Warmup) ---
-        # 前几轮不加权，让 VAE 和 GRL 充分预热
-        if epoch < self.warmup_epochs:
-            return weights
+        # 预热期返回全1
+        if epoch <= self.warmup_epochs:
+            return torch.ones_like(h)
 
-        # --- 2. 计算进度因子 (Progress) ---
-        # 将剩余的轮数映射到 [0, 1]
-        # 我们设定在 80% 的时候达到最难的关注点，最后 20% 保持稳定
+        # 进度控制：覆盖80%的训练周期
         effective_epochs = self.total_epochs - self.warmup_epochs
         current_step = epoch - self.warmup_epochs
-        progress = np.clip(current_step / (effective_epochs * 0.4 + 1e-6), 0.0, 1.0)
+        progress = np.clip(current_step / (effective_epochs * 0.8 + 1e-6), 0.0, 1.0)
 
-        # --- 3. 动态移动关注中心 (Moving Focus) ---
-        # 核心逻辑：关注中心 mu 从 0.3 (易) 逐渐滑向 0.8 (难)
-        # 这样 Epoch 10-25 学简单的，Epoch 40+ 强迫模型去学难的
-        mu = 0.3 + 0.5 * progress  
+        # [优化] 关注中心 mu: 0.3 -> 0.75 (留出顶部空间)
+        mu = 0.3 + 0.45 * progress  
         
-        # 聚焦范围 sigma：随着训练进行，聚焦越来越集中 (0.2 -> 0.15)
         sigma = 0.2 - 0.05 * progress
-        
-        # 加权强度 strength：后期强度更大 (1.0 -> 3.0)
         strength = 1.0 + 2.0 * progress
+        
+        # [优化] 基础权重衰减：1.0 -> 0.5
+        base_weight = 1.0 - 0.5 * progress
 
-        # --- 4. 高斯加权公式 ---
-        # w = 1 + strength * exp(...)
-        gaussian_weight = torch.exp(-0.5 * ((h - mu) ** 2) / (sigma ** 2))
-        weights = 1.0 + strength * gaussian_weight
+        # 高斯加权
+        gaussian_term = torch.exp(-0.5 * ((h - mu) ** 2) / (sigma ** 2))
+        weights = base_weight + strength * gaussian_term
 
-        # --- 5. 离群点熔断 (Outlier Cutoff) ---
-        # 始终抑制难度极高 (>0.95) 的样本，防止脏数据破坏模型
-        # 注意：这里的阈值要比 mu 的终点(0.8)高，给难样本留出空间
-        outlier_thresh = 0.95
-        mask_outlier = h > outlier_thresh
-        if mask_outlier.any():
-            # 对离群点降权到 0.1 (保留一点点梯度，或者直接设为0)
-            weights[mask_outlier] = 0.1
+        # [优化] 软熔断机制：提高阈值到 0.9
+        soft_start = 0.90
+        soft_end = 0.98 # 留一点余地，防止把 0.96 的样本全杀了
+        
+        outlier_mask = h > soft_start
+        if outlier_mask.any():
+            decay_factor = torch.clamp(
+                1.0 - (h[outlier_mask] - soft_start) / (soft_end - soft_start), 
+                min=0.0, max=1.0
+            )
+            weights[outlier_mask] *= decay_factor
+            weights[outlier_mask] += 0.05 # 兜底
 
-        # --- 6. 均值归一化 ---
-        # 保持 batch 总 loss 规模稳定
-        if weights.sum() > 1e-6:
-            weights = weights / weights.mean()
+        # [移除] 移除此处的均值归一化，交给 loss 层处理
+        # if weights.sum() > 1e-6:
+        #     weights = weights / weights.mean()
         
         return weights
-
+    
 def main():
     best_valid_results, best_test_results = {}, {}
 
@@ -209,20 +198,20 @@ def main():
 
 def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
          hardness_estimator=None, global_hardness=None,
-         use_hardness=False, use_loss_reweight=False, weight_scheduler=None):
+         use_hardness=False, use_loss_reweight=False, 
+         weight_scheduler=None, hardness_momentum=0.9): # [新增] 动量参数
     """
     训练一个 epoch。
-    如果 use_hardness=True：
-      - 每个 batch 估计一次 hardness（不反向）
-      - 用 hardness 做：
-          1) global_hardness 的滑动更新（给下个 epoch 采样用）
-          2) optional：对当前 batch 的情感预测 loss 做轻微重加权
+    改进点：
+      1. 修复 global_hardness 冷启动问题
+      2. 优化权重获取逻辑的鲁棒性
     """
     y_pred, y_true = [], []
     loss_dict = {}
 
     model.train()
     for cur_iter, data in enumerate(train_loader):
+        # 数据加载
         complete_input = (
             data['vision'].to(device),
             data['audio'].to(device),
@@ -237,11 +226,14 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
         sentiment_labels = data['labels']['M'].to(device)
         label = {'sentiment_labels': sentiment_labels}
 
+        # 前向传播
         out = model(complete_input, incomplete_input)
 
-        # ====== Step 1: 基于当前 batch 输出估计 hardness ======
+        # ====== Step 1: 难度感知与权重计算 ======
         sample_weights = None
+        
         if use_hardness and (hardness_estimator is not None):
+            # 1.1 计算当前 Batch 的瞬时难度
             batch_hardness = hardness_estimator(
                 preds=out['sentiment_preds'],
                 labels=label['sentiment_labels'],
@@ -252,58 +244,51 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
             if batch_hardness.dim() > 1:
                 batch_hardness = batch_hardness.view(-1)
 
-            # 1.1 更新全局 hardness（动量平滑）
+            # 1.2 更新全局 Hardness (动量平滑)
             if global_hardness is not None:
-                indices = data['index']           # [B]，Dataset 里返回的 index
+                indices = data['index']
                 if isinstance(indices, torch.Tensor):
                     idx_cpu = indices.long().cpu()
                 else:
                     idx_cpu = torch.tensor(indices, dtype=torch.long)
 
-                old_values = global_hardness[idx_cpu]        # [B]
-                new_values = batch_hardness.detach().cpu()   # [B]
+                # [修复] 冷启动逻辑：第1个epoch直接赋值，避免0值污染；后续epoch进行EMA更新
+                if epoch == 1:
+                    global_hardness[idx_cpu] = batch_hardness.detach().cpu()
+                else:
+                    old_values = global_hardness[idx_cpu]
+                    new_values = batch_hardness.detach().cpu()
+                    global_hardness[idx_cpu] = hardness_momentum * old_values + (1.0 - hardness_momentum) * new_values
 
-                momentum = 0.9
-                global_hardness[idx_cpu] = momentum * old_values + (1.0 - momentum) * new_values
+            # 1.3 获取用于加权的 Hardness
+            # [优化] 设置默认值，防止分支逻辑导致 current_h 未定义
+            current_h = batch_hardness 
 
-            # 1.2 把 hardness 映射为 loss 权重（可选）
             if use_loss_reweight and weight_scheduler is not None:
-               # [改进] 尝试从 global_hardness 获取当前 batch 的平滑难度
-               if global_hardness is not None:
-                 indices = data['index']
-                 if isinstance(indices, torch.Tensor):
-                    idx_cpu = indices.long().cpu()
-                 else:
-                    idx_cpu = torch.tensor(indices, dtype=torch.long)
+                # 优先读取平滑后的全局难度 (更稳定)
+                if global_hardness is not None:
+                    indices = data['index']
+                    if isinstance(indices, torch.Tensor):
+                        idx_cpu = indices.long().cpu()
+                    else:
+                        idx_cpu = torch.tensor(indices, dtype=torch.long)
+                    current_h = global_hardness[idx_cpu].to(device)
                 
-                 # 使用历史平滑难度 (更稳定)
-                 current_h = global_hardness[idx_cpu].to(device)
-            else:
-                # 降级方案
-               current_h = batch_hardness
+                # 调用调度器获取权重
+                sample_weights = weight_scheduler.get_weights(current_h, epoch, device)
 
-            sample_weights = weight_scheduler.get_weights(current_h, epoch, device)
-            #（0）最初始的方案： 简单线性映射：h∈[0,1] → w∈[0.5,1.5] ##3
-            #w = 0.5 + batch_h_smooth.to(device)    # [B]
-            #再归一化到均值为 1，避免改变 overall scale
-            #w = w / (w.mean() + 1e-8)
-            #sample_weights = w
-            ####
-            #sample_weights = map_hardness_to_weights(current_h, mode='piecewise', alpha= 1.0, device=device)
-
-        # ====== Step 2: 计算 loss（支持样本级加权） ======
+        # ====== Step 2: 计算 Loss (支持样本级加权) ======
         loss = loss_fn(out, label, sample_weights=sample_weights)
 
-        # ====== Step 3: 反向传播 & 更新参数 ======
+        # ====== Step 3: 反向传播 & 更新 ======
         optimizer.zero_grad()
         loss['loss'].backward()
         optimizer.step()
 
-        # ====== 记录预测与标签，用于计算指标 ======
+        # ====== 记录数据 ======
         y_pred.append(out['sentiment_preds'].detach().cpu())
         y_true.append(label['sentiment_labels'].detach().cpu())
 
-        # ====== 记录各项 loss，方便打印 ======
         if cur_iter == 0:
             for key, value in loss.items():
                 try:
@@ -317,12 +302,11 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
                 except:
                     loss_dict[key] += value
 
+    # ====== Epoch 结束后的统计 ======
     pred, true = torch.cat(y_pred), torch.cat(y_true)
     results = metrics(pred, true)
 
-    #{'Has0_acc_2': , 'Has0_F1_score': , 'Non0_acc_2': , 'Non0_F1_score': , 'Mult_acc_5': , 'Mult_acc_7': , 'MAE': , 'Corr': }
     loss_dict = {key: value / (cur_iter + 1) for key, value in loss_dict.items()}
-    #{'loss': , 'l_sp': , 'l_rec': , 'l_kl': }
     print(f'Train Loss Epoch {epoch}: {loss_dict}')
     print(f'Train Results Epoch {epoch}: {results}')
 
