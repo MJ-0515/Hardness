@@ -111,7 +111,7 @@ class P_RMF(nn.Module):
         #cma_t(proxy,t)*w_t + cma_a(proxy,a)*w_a + cma_v(proxy,v)*w_v + proxy
         #先对 token 做均值池化，再过 MLP(128→128→out_dim)得到情感预测值
 
-        """ ✅ 新增：融合特征（后面做检索 & hardness 用）"""
+        
         fusion_feat = torch.mean(feat, dim=1)  # [B, D]
 
         output = self.predict(fusion_feat) #(B,1)
@@ -131,7 +131,10 @@ class P_RMF(nn.Module):
                 'rec_feats': rec_feats,
                 'complete_feats': complete_feats,
                 'kl_loss': kl_loss,
-                'fusion_feat': fusion_feat    # ✅ 新增字段
+                'h_1_l': h_1_l,
+                'h_1_v': h_1_v,
+                'h_1_a': h_1_a,
+                'weight_t_v_a': weight_t_v_a
                 }
  
 
