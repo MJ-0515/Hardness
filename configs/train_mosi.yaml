@@ -1,34 +1,69 @@
 base:
   seed: 1111
-  lr: 0.0001
+  lr: 0.00005
   weight_decay: 0.0001
-  batch_size: 32
+  batch_size: 16
   n_epochs: 100
   num_workers: 0
   gamma: 0.1
   sigma: 1.0
   kl: 0.5
   train_mode: regression # only support regression now
-  missing_rate_eval_test: 0.5   # used for evaluation and testing
+  missing_rate_eval_test: 0.5 # used for evaluation and testing
   do_validation: true
-  use_hardness: True  # 打开难度感知，默认是 False
-
+  use_hardness: True # 打开难度感知，默认是 False
 
 dataset:
   datasetName: mosi
   dataPath: /root/autodl-fs/data/MSA_Datasets/MOSI/unaligned_50.pkl
-   
+
 hardness:
-  alpha_pred: 0.7     # 预测误差占比
-  alpha_rec: 0.3       # 重构误差占比
-  eps: 1e-6
-  use_loss_reweight: True  # 打开 hard 样本轻微重加权
+  enable: true
 
+  estimator: # 难度估计器相关参数
+    alpha_direct: 0.35 
+    alpha_indirect: 0.20 
+    alpha_unc: 0.15
+    alpha_task: 0.20
+    alpha_miss: 0.10
+    beta: 2.5
+    topk_ratio: 0.5  #
+    use_cos: true
+    use_var: true
+    rn_momentum: 0.02
 
-model:    
+  bank: # 用于存储历史难度信息
+    momentum: 0.05
+
+  scheduler: # 难度课程相关参数
+    warmup_epochs: 3
+
+    # 自适应分位数课程
+    q_start: 0.40 # 课程开始时的分位数
+    q_end: 1.00  # 课程结束时的分位数
+
+    # 门控温度退火
+    temp_start: 0.10  # 门控初始温度
+    temp_end: 0.03    # 门控最终温度
+
+    # rank 重加权强度
+    eta_max: 0.60   # rank 重加权最大强度
+    p_pred: 2.0     # pred 重加权指数
+    p_rec: 1.5      # rec 重加权指数
+
+    # 是否对重构项也做课程门控
+    gate_rec: false
+
+    # pred 用 task 难度，rec 用 direct 难度
+    use_split_sources: true
+
+    w_clip_min: 0.2  #
+    w_clip_max: 5.0
+
+model:
   feature_extractor:
-    bert_pretrained: '/root/autodl-fs/bert/bert-base-uncased' #    bert_pretrained: '../bert/bert-large-uncased'
-    transformers: 'bert'  # transformers: bert
+    bert_pretrained: "/root/autodl-fs/bert/bert-base-uncased" #    bert_pretrained: '../bert/bert-large-uncased'
+    transformers: "bert" # transformers: bert
     input_length: [50, 500, 375] # language, video, audio
     token_length: [8, 8, 8] # language, video, audio
     heads: 8
@@ -67,4 +102,3 @@ model:
     input_dim: 128
     hidden_dim: 128
     out_dim: 1
-
