@@ -12,10 +12,7 @@ from tqdm import tqdm
 import time
 import csv
 from pathlib import Path
-
-#from torch.utils.data import DataLoader, WeightedRandomSampler
 from models.hardness import HardnessEstimator, HardnessBank, AdaptiveHardnessScheduler
-
 from core.hard_log import hardness_diagnostics
 
 start = time.time()
@@ -48,17 +45,29 @@ def main():
     config_file = 'configs/train_mosi.yaml' if opt.config_file == '' else opt.config_file
     with open(config_file) as f:
         args = yaml.load(f, Loader=yaml.FullLoader)
+    
+    print("*********************************train.yaml中的内容***********************************")
+    print(args) 
 
+    #最终seed看train.yaml中的'base'里seed的值
     seed = args['base']['seed'] if opt.seed == -1 else opt.seed
     setup_seed(seed)
+    print("-------------------------------------------------------------------------------")
+    print("seed is fixed to {}".format(seed))
+    print("-------------------------------------------------------------------------------")
 
     ckpt_root = os.path.join('ckpt', args['dataset']['datasetName'])
     os.makedirs(ckpt_root, exist_ok=True)
-
     stats_csv = os.path.join(ckpt_root, f"hardness_stats_seed{seed}.csv")
-
+    print("------------------------------------------------------------------------------")
+    print("ckpt root :", ckpt_root)
+    print("stats_csv  :", stats_csv)
+    print("------------------------------------------------------------------------------")
 
     model = build_model(args).to(device)
+    print("\033[1;35mTotal parameters: {}, Trainable parameters: {}\033[0m".format(*get_parameter_number(model)))
+
+    # 加载完整数据 和 经过缺失处理的数据
     dataLoader = MMDataLoader(args)
 
     optimizer = torch.optim.AdamW([
@@ -73,22 +82,24 @@ def main():
     ], weight_decay=args['base']['weight_decay'])
 
     scheduler_warmup = get_scheduler(optimizer, args)
+    #损失实例,包括gamma系数，sigma系数，kl系数，CE损失，MSE损失
     loss_fn = MultimodalLoss(args)
+    #评测指标实例
     metrics = MetricsTop(train_mode=args['base']['train_mode']).getMetics(args['dataset']['datasetName'])
 
     # 1) 初始化难度模块
     use_hard = bool(args.get("hardness", {}).get("enable", True))
     hard_est, hard_bank, hard_sched = None, None, None
     if use_hard:
-        hard_est = HardnessEstimator(args["hardness"]["estimator"]).to(device)
+        hard_est = HardnessEstimator(args["hardness"]["estimator"]).to(device) #难度估计器初始化
 
-        # bank 放 CPU 即可，节省显存
+        # 难度记忆库  初始化, bank 放 CPU 即可，节省显存，因为只在每个 batch 结束后更新
         hard_bank = HardnessBank(
             num_samples=len(dataLoader["train"].dataset),
             momentum=float(args["hardness"]["bank"].get("momentum", 0.05)),
             device="cpu"
-        )
-
+        ) 
+        # 自适应难度调度器 初始化
         hard_sched = AdaptiveHardnessScheduler(
             args["hardness"]["scheduler"],
             total_epochs=int(args["base"]["n_epochs"])
@@ -138,41 +149,42 @@ def main():
         scheduler_warmup.step()
 
 
-def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
-          use_hard=False, hard_est=None, hard_bank=None, hard_sched=None,
-          stats_csv_path=None):
+def train(model, train_loader, optimizer, loss_fn, epoch, metrics, use_hard=False, hard_est=None, hard_bank=None, hard_sched=None, stats_csv_path=None):
     y_pred, y_true = [], []
     loss_dict = {}
 
     # 统计容器
-    eff_pred_sum = 0.0
-    eff_pred_cnt = 0
-    w_pred_buf = []
-    h_all_buf = []
+    eff_pred_sum = 0.0 # 有效预测权重之和
+    eff_pred_cnt = 0  # 有效预测权重计数
+    w_pred_buf = []   # 预测权重缓冲区
+    h_all_buf = []    # 综合难度缓冲区
 
     model.train()
+    # 读取 train_loader 会调用 dataset中的__getitem__函数,读够一个batch（32）的数据就开始往下走
     for cur_iter, data in enumerate(train_loader):
         complete_input = (data['vision'].to(device), data['audio'].to(device), data['text'].to(device))
         incomplete_input = (data['vision_m'].to(device), data['audio_m'].to(device), data['text_m'].to(device))
 
         sentiment_labels = data['labels']['M'].to(device)
         label = {'sentiment_labels': sentiment_labels}
-
+        #--------！！！开始前向传播：进入P-RMFmodel的forward函数 ！！！------------------
+        # 返回值out字典：{'sentiment_preds':预测值,'rec_feats':可用于重建损失的重建特征或None,
+        #                'complete_feats':对齐监督的完整特征或None, 'kl_loss':PMG的KL/重建混合项}
         out = model(complete_input, incomplete_input)
 
         # 默认权重与门控
-        w_pred = None
-        w_rec = None
-        m_pred = None
-        m_rec = None
-        h_all = None  # 为统计输出保留
+        w_pred = None  #预测损失权重 
+        w_rec = None   #重建损失权重
+        m_pred = None  #预测损失门控
+        m_rec = None   #重建损失门控
+        h_all = None   #为统计输出保留
 
         if use_hard:
-            indices = data['index']
-            if not torch.is_tensor(indices):
+            indices = data['index'] #读取一个batch的Index
+            if not torch.is_tensor(indices): # 转为 tensor
                 indices = torch.tensor(indices, dtype=torch.long)
 
-            with torch.no_grad():
+            with torch.no_grad():# 用于计算难度的前向传播
                 # 1) 计算当前 batch 难度
                 h_now, parts = hard_est(out, label, data, is_train=True)
 
@@ -213,8 +225,8 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
             label,
             sample_weight_pred=w_pred,
             sample_weight_rec=w_rec,
-            sample_mask_pred=m_pred,
-            sample_mask_rec=m_rec
+            sample_mask_pred=None,
+            sample_mask_rec=None
         )
 
         loss['loss'].backward()
@@ -242,12 +254,12 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics,
     # epoch 汇总统计（新增）
     hardness_epoch_stats = None
     if use_hard and eff_pred_cnt > 0 and len(w_pred_buf) > 0 and len(h_all_buf) > 0:
-        w_pred_all = torch.cat(w_pred_buf, dim=0)
+        w_pred_all = torch.cat(w_pred_buf, dim=0) #
         h_all_all = torch.cat(h_all_buf, dim=0)
 
-        eff_pred_mean = eff_pred_sum / eff_pred_cnt
-        wq10, wq50, wq90 = _quantiles_1d(w_pred_all, qs=(0.10, 0.50, 0.90))
-        hq10, hq50, hq90 = _quantiles_1d(h_all_all, qs=(0.10, 0.50, 0.90))
+        eff_pred_mean = eff_pred_sum / eff_pred_cnt  # 有效预测权重均值
+        wq10, wq50, wq90 = _quantiles_1d(w_pred_all, qs=(0.10, 0.50, 0.90))  #预测权重分位数
+        hq10, hq50, hq90 = _quantiles_1d(h_all_all, qs=(0.10, 0.50, 0.90))   #综合难度分位数
 
         print(
             f"[Hardness][Epoch {epoch}] "
